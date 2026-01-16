@@ -55,6 +55,7 @@ import { createOpencodeClient, type Message, type Part } from "@opencode-ai/sdk/
 import { Binary } from "@opencode-ai/util/binary"
 import { showToast } from "@opencode-ai/ui/toast"
 import { base64Encode } from "@opencode-ai/util/encode"
+import { createAsrRecorder } from "@/utils/asr"
 
 const ACCEPTED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"]
 const ACCEPTED_FILE_TYPES = [...ACCEPTED_IMAGE_TYPES, "application/pdf"]
@@ -118,6 +119,19 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   const providers = useProviders()
   const command = useCommand()
   const permission = usePermission()
+
+  // ASR 录音器
+  const recorder = createAsrRecorder({
+    onTranscribe: (text) => {
+      addPart({ type: "text", content: text, start: 0, end: 0 })
+    },
+    onError: (error) => {
+      showToast({
+        title: "语音识别失败",
+        description: error.message,
+      })
+    },
+  })
   let editorRef!: HTMLDivElement
   let fileInputRef!: HTMLInputElement
   let scrollRef!: HTMLDivElement
@@ -1649,6 +1663,26 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
             <div class="flex items-center gap-2">
               <SessionContextUsage />
               <Show when={store.mode === "normal"}>
+                <Tooltip placement="top" value={recorder.isRecording() || recorder.isTranscribing() ? "录音中..." : "语音输入"}>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    classList={{
+                      "size-6": true,
+                      "text-icon-danger-active": recorder.isRecording(),
+                      "animate-pulse": recorder.isRecording() || recorder.isTranscribing(),
+                    }}
+                    onClick={() => recorder.toggleRecording()}
+                    disabled={recorder.isTranscribing()}
+                  >
+                    <Show
+                      when={recorder.isRecording() || recorder.isTranscribing()}
+                      fallback={<Icon name="bubble-5" class="size-4.5" />}
+                    >
+                      <Icon name="circle-ban-sign" class="size-4.5" />
+                    </Show>
+                  </Button>
+                </Tooltip>
                 <Tooltip placement="top" value="Attach file">
                   <Button type="button" variant="ghost" class="size-6" onClick={() => fileInputRef.click()}>
                     <Icon name="photo" class="size-4.5" />
