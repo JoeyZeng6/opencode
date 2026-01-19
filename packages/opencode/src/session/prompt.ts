@@ -254,8 +254,17 @@ export namespace SessionPrompt {
     return
   }
 
+  /**
+   * 会话消息处理循环
+   * 这是 OpenCode 的核心处理函数，负责处理用户消息并生成 AI 响应
+   * 
+   * @param sessionID - 会话 ID
+   * @returns 返回包含助手消息和部分的完整消息对象
+   */
   export const loop = fn(Identifier.schema("session"), async (sessionID) => {
+    // 启动会话处理，获取 abort 信号用于取消操作
     const abort = start(sessionID)
+    // 如果会话已经在处理中，将当前请求加入回调队列等待
     if (!abort) {
       return new Promise<MessageV2.WithParts>((resolve, reject) => {
         const callbacks = state()[sessionID].callbacks
@@ -263,58 +272,118 @@ export namespace SessionPrompt {
       })
     }
 
+    // 使用 defer 确保在函数退出时取消会话处理
     using _ = defer(() => cancel(sessionID))
 
-    let step = 0
+    let step = 0 // 当前处理步骤计数
     const session = await Session.get(sessionID)
+    
+    // 主处理循环：持续处理消息直到完成或中断
     while (true) {
+      // 设置会话状态为忙碌
       SessionStatus.set(sessionID, { type: "busy" })
       log.info("loop", { step, sessionID })
-      if (abort.aborted) break
+      
+      // 如果收到取消信号，退出循环
+      if (abort.aborted) {
+        log.info("loop aborted", { step, sessionID })
+        break
+      }
+      
+      // 获取并过滤已压缩的消息流
       let msgs = await MessageV2.filterCompacted(MessageV2.stream(sessionID))
+      log.debug("messages loaded", { step, sessionID, messageCount: msgs.length })
 
+      // 从消息流中查找关键消息：
+      // - lastUser: 最后一个用户消息
+      // - lastAssistant: 最后一个助手消息
+      // - lastFinished: 最后一个已完成的助手消息
+      // - tasks: 待处理的任务（压缩或子任务）
       let lastUser: MessageV2.User | undefined
       let lastAssistant: MessageV2.Assistant | undefined
       let lastFinished: MessageV2.Assistant | undefined
       let tasks: (MessageV2.CompactionPart | MessageV2.SubtaskPart)[] = []
+      
+      // 从后往前遍历消息，找到最新的用户消息和已完成的助手消息
       for (let i = msgs.length - 1; i >= 0; i--) {
         const msg = msgs[i]
         if (!lastUser && msg.info.role === "user") lastUser = msg.info as MessageV2.User
         if (!lastAssistant && msg.info.role === "assistant") lastAssistant = msg.info as MessageV2.Assistant
         if (!lastFinished && msg.info.role === "assistant" && msg.info.finish)
           lastFinished = msg.info as MessageV2.Assistant
+        // 如果找到了用户消息和已完成的助手消息，可以停止查找
         if (lastUser && lastFinished) break
+        // 收集待处理的压缩或子任务
         const task = msg.parts.filter((part) => part.type === "compaction" || part.type === "subtask")
         if (task && !lastFinished) {
           tasks.push(...task)
         }
       }
 
+      log.debug("message analysis", {
+        step,
+        sessionID,
+        hasLastUser: !!lastUser,
+        hasLastAssistant: !!lastAssistant,
+        hasLastFinished: !!lastFinished,
+        tasksCount: tasks.length,
+        tasks: tasks.map((t) => ({ type: t.type, agent: t.type === "subtask" ? t.agent : undefined })),
+      })
+
+      // 必须存在用户消息，否则抛出错误
       if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+      
+      // 如果助手消息已完成且不是工具调用类型，且用户消息在助手消息之前，说明对话已完成
       if (
         lastAssistant?.finish &&
         !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
         lastUser.id < lastAssistant.id
       ) {
-        log.info("exiting loop", { sessionID })
+        log.info("exiting loop - conversation completed", {
+          sessionID,
+          step,
+          finishReason: lastAssistant.finish,
+          lastUserID: lastUser.id,
+          lastAssistantID: lastAssistant.id,
+        })
         break
       }
 
       step++
-      if (step === 1)
+      log.info("processing step", { step, sessionID, agent: lastUser.agent, model: `${lastUser.model.providerID}/${lastUser.model.modelID}` })
+      
+      // 第一步时，确保会话有标题
+      if (step === 1) {
+        log.debug("ensuring title for session", { sessionID })
         ensureTitle({
           session,
           modelID: lastUser.model.modelID,
           providerID: lastUser.model.providerID,
           history: msgs,
         })
+      }
 
+      // 获取模型配置
       const model = await Provider.getModel(lastUser.model.providerID, lastUser.model.modelID)
+      // 取出一个待处理的任务（LIFO：后进先出）
       const task = tasks.pop()
+      
+      if (task) {
+        log.info("task found", { step, sessionID, taskType: task.type, taskAgent: task.type === "subtask" ? task.agent : undefined })
+      }
 
-      // pending subtask
-      // TODO: centralize "invoke tool" logic
+      // ========== 处理待执行的子任务 ==========
+      // 子任务是通过 task 工具触发的子代理执行
+      // TODO: 集中化 "调用工具" 的逻辑
       if (task?.type === "subtask") {
+        log.info("processing subtask", {
+          step,
+          sessionID,
+          subtaskAgent: task.agent,
+          description: task.description,
+          command: task.command,
+        })
+        // 初始化任务工具并创建助手消息
         const taskTool = await TaskTool.init()
         const assistantMessage = (await Session.updateMessage({
           id: Identifier.ascending("message"),
@@ -360,12 +429,15 @@ export namespace SessionPrompt {
             },
           },
         })) as MessageV2.ToolPart
+        // 准备任务参数
         const taskArgs = {
           prompt: task.prompt,
           description: task.description,
           subagent_type: task.agent,
           command: task.command,
         }
+        
+        // 触发工具执行前的插件钩子
         await Plugin.trigger(
           "tool.execute.before",
           {
@@ -375,8 +447,11 @@ export namespace SessionPrompt {
           },
           { args: taskArgs },
         )
+        
         let executionError: Error | undefined
         const taskAgent = await Agent.get(task.agent)
+        
+        // 创建任务执行上下文，包含权限检查、元数据更新等功能
         const taskCtx: Tool.Context = {
           agent: task.agent,
           messageID: assistantMessage.id,
@@ -402,11 +477,33 @@ export namespace SessionPrompt {
             })
           },
         }
+        
+        // 执行任务工具，捕获可能的错误
+        log.debug("executing task tool", { step, sessionID, taskAgent: task.agent, callID: part.callID })
         const result = await taskTool.execute(taskArgs, taskCtx).catch((error) => {
           executionError = error
-          log.error("subtask execution failed", { error, agent: task.agent, description: task.description })
+          log.error("subtask execution failed", {
+            step,
+            sessionID,
+            error,
+            agent: task.agent,
+            description: task.description,
+            callID: part.callID,
+          })
           return undefined
         })
+        
+        if (result) {
+          log.info("subtask execution completed", {
+            step,
+            sessionID,
+            taskAgent: task.agent,
+            title: result.title,
+            hasAttachments: !!result.attachments?.length,
+          })
+        }
+        
+        // 触发工具执行后的插件钩子
         await Plugin.trigger(
           "tool.execute.after",
           {
@@ -416,9 +513,13 @@ export namespace SessionPrompt {
           },
           result,
         )
+        
+        // 标记助手消息为已完成（工具调用类型）
         assistantMessage.finish = "tool-calls"
         assistantMessage.time.completed = Date.now()
         await Session.updateMessage(assistantMessage)
+        
+        // 如果执行成功，更新工具部分的状态为已完成
         if (result && part.state.status === "running") {
           await Session.updatePart({
             ...part,
@@ -436,6 +537,8 @@ export namespace SessionPrompt {
             },
           } satisfies MessageV2.ToolPart)
         }
+        
+        // 如果执行失败，更新工具部分的状态为错误
         if (!result) {
           await Session.updatePart({
             ...part,
@@ -452,9 +555,9 @@ export namespace SessionPrompt {
           } satisfies MessageV2.ToolPart)
         }
 
-        // Add synthetic user message to prevent certain reasoning models from erroring
-        // If we create assistant messages w/ out user ones following mid loop thinking signatures
-        // will be missing and it can cause errors for models like gemini for example
+        // 添加一个合成的用户消息，防止某些推理模型出错
+        // 如果我们在循环中创建助手消息而没有后续的用户消息，
+        // 思考签名会缺失，这可能导致某些模型（如 gemini）出错
         const summaryUserMsg: MessageV2.User = {
           id: Identifier.ascending("message"),
           sessionID,
@@ -478,8 +581,10 @@ export namespace SessionPrompt {
         continue
       }
 
-      // pending compaction
+      // ========== 处理待执行的压缩任务 ==========
+      // 压缩用于减少上下文长度，将旧消息合并为摘要
       if (task?.type === "compaction") {
+        log.info("processing compaction", { step, sessionID, auto: task.auto, parentID: lastUser.id })
         const result = await SessionCompaction.process({
           messages: msgs,
           parentID: lastUser.id,
@@ -487,16 +592,25 @@ export namespace SessionPrompt {
           sessionID,
           auto: task.auto,
         })
+        log.info("compaction completed", { step, sessionID, result })
         if (result === "stop") break
         continue
       }
 
-      // context overflow, needs compaction
+      // ========== 上下文溢出，需要压缩 ==========
+      // 检查最后完成的助手消息是否导致上下文溢出
+      // 如果溢出，自动创建压缩任务
       if (
         lastFinished &&
         lastFinished.summary !== true &&
         (await SessionCompaction.isOverflow({ tokens: lastFinished.tokens, model }))
       ) {
+        log.info("context overflow detected, creating compaction", {
+          step,
+          sessionID,
+          tokens: lastFinished.tokens,
+          model: `${model.providerID}/${model.id}`,
+        })
         await SessionCompaction.create({
           sessionID,
           agent: lastUser.agent,
@@ -506,16 +620,29 @@ export namespace SessionPrompt {
         continue
       }
 
-      // normal processing
+      // ========== 正常消息处理流程 ==========
+      // 获取代理配置，检查是否达到最大步骤数
       const agent = await Agent.get(lastUser.agent)
       const maxSteps = agent.steps ?? Infinity
       const isLastStep = step >= maxSteps
+      
+      log.info("normal processing", {
+        step,
+        sessionID,
+        agent: agent.name,
+        maxSteps,
+        isLastStep,
+        model: `${model.providerID}/${model.id}`,
+      })
+      
+      // 插入提醒信息（如计划模式、构建模式切换等）
       msgs = await insertReminders({
         messages: msgs,
         agent,
         session,
       })
 
+      // 创建会话处理器，用于处理助手消息的生成
       const processor = SessionProcessor.create({
         assistantMessage: (await Session.updateMessage({
           id: Identifier.ascending("message"),
@@ -546,10 +673,13 @@ export namespace SessionPrompt {
         abort,
       })
 
-      // Check if user explicitly invoked an agent via @ in this turn
+      // 检查用户是否在当前轮次中通过 @ 显式调用了代理
+      // 如果显式调用，则绕过代理检查
       const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
       const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
 
+      // 解析并准备可用的工具
+      log.debug("resolving tools", { step, sessionID, agent: agent.name, bypassAgentCheck })
       const tools = await resolveTools({
         agent,
         session,
@@ -558,7 +688,14 @@ export namespace SessionPrompt {
         processor,
         bypassAgentCheck,
       })
+      log.debug("tools resolved", {
+        step,
+        sessionID,
+        toolCount: Object.keys(tools).length,
+        toolIds: Object.keys(tools),
+      })
 
+      // 第一步时，异步生成会话摘要
       if (step === 1) {
         SessionSummary.summarize({
           sessionID: sessionID,
@@ -566,9 +703,11 @@ export namespace SessionPrompt {
         })
       }
 
+      // 克隆消息列表，避免修改原始数据
       const sessionMessages = clone(msgs)
 
-      // Ephemerally wrap queued user messages with a reminder to stay on track
+      // 临时包装排队的用户消息，添加提醒以保持任务跟踪
+      // 当步骤大于 1 且存在已完成的助手消息时，为后续的用户消息添加系统提醒
       if (step > 1 && lastFinished) {
         for (const msg of sessionMessages) {
           if (msg.info.role !== "user" || msg.info.id <= lastFinished.id) continue
@@ -587,14 +726,25 @@ export namespace SessionPrompt {
         }
       }
 
+      // 触发插件进行消息转换
       await Plugin.trigger("experimental.chat.messages.transform", {}, { messages: sessionMessages })
 
+      // 调用处理器处理消息，生成 AI 响应
+      log.info("calling LLM processor", {
+        step,
+        sessionID,
+        messageCount: sessionMessages.length,
+        toolCount: Object.keys(tools).length,
+        isLastStep,
+      })
       const result = await processor.process({
         user: lastUser,
         agent,
         abort,
         sessionID,
+        // 系统提示词：包含环境信息和自定义提示词
         system: [...(await SystemPrompt.environment()), ...(await SystemPrompt.custom())],
+        // 消息列表：转换为模型格式，如果是最后一步则添加最大步骤数提醒
         messages: [
           ...MessageV2.toModelMessage(sessionMessages),
           ...(isLastStep
@@ -606,11 +756,21 @@ export namespace SessionPrompt {
               ]
             : []),
         ],
-        tools,
-        model,
+        tools, // 可用的工具列表
+        model, // 使用的模型配置
       })
-      if (result === "stop") break
+      
+      log.info("processor result", { step, sessionID, result, messageID: processor.message.id })
+      
+      // 如果处理结果要求停止，退出循环
+      if (result === "stop") {
+        log.info("processor requested stop", { step, sessionID })
+        break
+      }
+      
+      // 如果处理结果要求压缩，创建压缩任务后继续
       if (result === "compact") {
+        log.info("processor requested compaction", { step, sessionID })
         await SessionCompaction.create({
           sessionID,
           agent: lastUser.agent,
@@ -620,13 +780,24 @@ export namespace SessionPrompt {
       }
       continue
     }
+    
+    // ========== 循环结束后的清理和返回 ==========
+    log.info("loop completed", { sessionID, finalStep: step })
+    
+    // 清理压缩数据
     SessionCompaction.prune({ sessionID })
+    
+    // 从消息流中查找最新的助手消息并返回
+    // 同时解决所有等待的回调
+    log.debug("finding final assistant message", { sessionID })
     for await (const item of MessageV2.stream(sessionID)) {
       if (item.info.role === "user") continue
       const queued = state()[sessionID]?.callbacks ?? []
+      log.debug("resolving callbacks", { sessionID, callbackCount: queued.length, messageID: item.info.id })
       for (const q of queued) {
         q.resolve(item)
       }
+      log.info("returning final message", { sessionID, messageID: item.info.id, role: item.info.role })
       return item
     }
     throw new Error("Impossible")
