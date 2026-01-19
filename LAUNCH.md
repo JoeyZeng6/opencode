@@ -235,7 +235,8 @@ bun run packages/opencode/src/index.ts run
 bun run --cwd packages/app dev
 
 # 终端 3: 启动 Desktop 客户端
-bun run --cwd packages/desktop dev
+
+bun run --cwd packages/desktop tauri dev
 ```
 
 所有客户端会同步显示相同的会话和消息。
